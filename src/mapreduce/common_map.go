@@ -11,6 +11,25 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(filename string, contents string) []KeyValue,
 ) {
+
+	inContent, err := ioutil.ReadFile(inFile)
+	if err != nil {
+			fmt.Print(err)
+	}
+
+
+	keyValues, err := mapF(inFile, inContent)
+	if err != nil {
+			fmt.Print("error in mapF")
+	}
+
+
+	for kv := range keyValues {
+			r := ihash(kv.Key)
+					reduceNameFile := reduceName(jobName, map)
+	}
+
+
 	//
 	// doMap manages one map task: it should read one of the input files
 	// (inFile), call the user-defined map function (mapF) for that file's
