@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"os"
-	"fmt"
+	"log"
 )
 
 func doMap(
@@ -15,40 +15,59 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(filename string, contents string) []KeyValue,
 ) {
-
+	// key point:
+	// understand map task id and reduce task id, multi => multi
 	inContent, err := ioutil.ReadFile(inFile)
 	if err != nil {
-		fmt.Println(err)
-		return
+		log.Fatal(err)
 	}
 
 	keyValues := mapF(inFile, string(inContent))
-
-	var key2FileContent map[string][]string = map[string][]string{} 
-	for kv := range keyValues {
-		key2FileContent[kv.Key] = append(key2FileContent[kv.key], kv.Value)
-	}
-
-	for k, v := range key2FileContent {
-		r := ihash(k) % nReduce
+	for _, kv := range keyValues {
+		r := ihash(kv.Key) % nReduce
 		reduceNameFile := reduceName(jobName, mapTask, r)
 		f, err := os.OpenFile(reduceNameFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0755)
 		if err != nil {
-			fmt.Println(err)
-			return
+			log.Fatal(err)
 		}
 
-		
-		var m map[string][]string = map[string][]string{}
-		m[k] = v
-		data, err := json.Marshal(m)
-		if err != nil {
-			fmt.Println(err)
-			return
+		enc := json.NewEncoder(f)
+		if  enc.Encode(&kv) != nil {
+			log.Fatal(err)
 		}
-		f.WriteString(string(data))
-		f.Close()
 	}
+
+	// var key2FileContent map[string][]string = map[string][]string{} 
+	// for _, kv := range keyValues {
+	// 	key2FileContent[kv.Key] = append(key2FileContent[kv.Key], kv.Value)
+	// }
+
+	// for k, v := range key2FileContent {
+	// 	r := ihash(k) % nReduce
+	// 	reduceNameFile := reduceName(jobName, mapTask, r)
+	// 	f, err := os.OpenFile(reduceNameFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0755)
+	// 	if err != nil {
+	// 		fmt.Println(err)
+	// 		return
+	// 	}
+
+		
+	// 	for _, val := range v {
+	// 		var m map[string]string = map[string]string{}
+	// 		m[k] = val
+	// 		data, err := json.Marshal(m)
+	// 		if err != nil {
+	// 			fmt.Println(err)
+	// 			return
+	// 		}
+	// 		f.WriteString(string(data))
+	// 		enc := json.NewEncoder(f)
+	// 		for _, kv := ... {
+	// 			err := enc.Encode(&kv)
+	// 		}
+	// 	}
+	// 	f.Close()
+	// }
 
 	//
 	// doMap manages one map task: it should read one of the input files
