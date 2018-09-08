@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"mapreduce"
 	"os"
+	"strings"
+	"strconv"
+	"unicode"
 )
 
 //
@@ -13,8 +16,25 @@ import (
 // and look only at the contents argument. The return value is a slice
 // of key/value pairs.
 //
+
+func wordSplitter(r rune) bool {
+	return ! unicode.IsLetter(r)
+}
+
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// Your code here (Part II).
+
+	mp := make(map[string]int)
+	for _, line := range strings.FieldsFunc(contents, wordSplitter) {
+		mp[line] += 1
+	}
+
+	kvs := make([]mapreduce.KeyValue, 0, len(mp))
+	for k, v := range mp {
+		kvs = append(kvs, mapreduce.KeyValue{Key : k, Value : strconv.Itoa(v)})
+	}
+
+	return kvs
 }
 
 //
@@ -24,6 +44,17 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 //
 func reduceF(key string, values []string) string {
 	// Your code here (Part II).
+	sum := 0
+	for _, v := range values {
+		v, err := strconv.Atoi(v)
+		if err == nil {
+			sum += v
+		} else {
+			fmt.Printf("Failed to convert %s to number, %s\n", v, err)
+		}
+	}
+
+	return strconv.Itoa(sum)
 }
 
 // Can be run in 3 ways:
