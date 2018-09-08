@@ -5,6 +5,31 @@ import (
 	"sync"
 )
 
+
+func scheduleOneWork(jobName string, mapFiles []string, phase jobPhase, n_other int,
+	registerChan chan string, index int, idleWorkerChan chan string, waitGroup *sync.WaitGroup) {
+	var worker string
+	select {
+		case worker = <-registerChan:
+		case worker = <-idleWorkerChan:
+	}
+	arg := DoTaskArgs{jobName, mapFiles[index],
+		phase,index,n_other}
+	// if worker failed, re-schedule this task
+	if ! call(worker, "Worker.DoTask", arg, nil) {
+		go scheduleOneWork(jobName, mapFiles, phase, n_other, registerChan, index, idleWorkerChan, waitGroup)
+		return
+	}
+
+	// avoid block here when no task to consumer this worker,
+	select {
+		case idleWorkerChan <- worker:
+		default:
+			break
+	}
+	waitGroup.Done()
+}
+
 //
 // schedule() starts and waits for all tasks in the given phase (mapPhase
 // or reducePhase). the mapFiles argument holds the names of the files that
@@ -36,31 +61,15 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
 	var waitGroup = new(sync.WaitGroup)
 
-	idleWorker := make(chan string)
+	idleWorkerChan := make(chan string)
 	for i := 0 ; i < ntasks; i++ {
 		waitGroup.Add(1)
-		go func(index int) {
-			var worker string
-			select {
-				case worker = <-registerChan:
-				case worker = <-idleWorker:
-			}
-			arg := DoTaskArgs{jobName, mapFiles[index],
-			phase,index,n_other}
-			call(worker, "Worker.DoTask", arg, nil)
-
-			// avoid block here when no task to consumer this worker,
-			select {
-				case idleWorker <- worker:
-				default:
-						break
-			}
-			waitGroup.Done()
-		}(i)
+		go scheduleOneWork(jobName, mapFiles, phase, n_other,
+			registerChan, i, idleWorkerChan, waitGroup)
 	}
 
 	waitGroup.Wait()
-	close(idleWorker)
+	close(idleWorkerChan)
 
 	fmt.Printf("Schedule: %v done\n", phase)
 }
