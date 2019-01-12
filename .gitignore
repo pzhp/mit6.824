@@ -1,3 +1,5 @@
 pkg/
 api.key
+.idea
+.vscode
 *-handin.tar.gz
