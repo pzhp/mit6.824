@@ -42,6 +42,13 @@ Go RPC is a simple form of "at-most-once"
     perhaps server processed request but server/net failed before reply came back
 
 #Lab2
+Questions in 2A:
+  become candidate at the same time
+    deadlock:
+    term update always the same, cannot get Vote from peer:
+      after vote timeout, set votedFor = -1, then cancel broadcast vote when accept remote vote meanwwhile
+  timeout range
+
 
 a) heartbeat period not two small, and leader recovery time not too large
 
@@ -52,6 +59,7 @@ snapshot and record append operations.
 checkpoint in another thread, remained work use another log
 log gap
 version
+
 
 ###
 

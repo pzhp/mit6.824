@@ -42,6 +42,7 @@ import "labrpc"
 const ELECTION_TIMEOUT_MIN int32 = 800     // ms
 const ELECTION_TIMEOUT_MAX int32 = 1200    // ms
 const HEARTBEAT_PERIOD time.Duration = 200 // ms
+const RPC_CALL_TIMEOUT = 500               // ms
 
 func getElectionTimeout() time.Duration {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -101,11 +102,9 @@ type Raft struct {
 
 	applyChan chan ApplyMsg
 
-	heartbeatTicker   *time.Ticker
 	heartbeatTickerCh chan bool // for close
 	heartbeatTickerMu sync.Mutex
-	voteTicker        *time.Ticker // election
-	voteTickerCh      chan bool    // for close
+	voteTickerCh      chan bool // for close
 	voteTickerMu      sync.Mutex
 
 	exitCh chan bool // system exit, close it to notify all routines to exit
@@ -209,9 +208,9 @@ func (rf *Raft) closeHeartBeatTicker() {
 	rf.debug("closeHeartBeatTicker")
 	// rf.heartbeatTickerMu.Lock()
 	if rf.heartbeatTickerCh != nil {
-		rf.heartbeatTickerCh <- true
-		time.Sleep(10 * time.Millisecond)
-		// close(rf.heartbeatTickerCh)
+		// rf.heartbeatTickerCh <- true
+		// time.Sleep(10 * time.Millisecond)
+		close(rf.heartbeatTickerCh)
 		rf.heartbeatTickerCh = nil
 	}
 	// rf.heartbeatTickerMu.Unlock()
@@ -224,9 +223,9 @@ func (rf *Raft) closeVoteTicker(block bool) {
 	}
 	if rf.voteTickerCh != nil {
 		// block by default
-		rf.voteTickerCh <- true
-		time.Sleep(10 * time.Millisecond)
-		// close(rf.voteTickerCh)
+		// rf.voteTickerCh <- true
+		// time.Sleep(10 * time.Millisecond)
+		close(rf.voteTickerCh)
 		rf.voteTickerCh = nil
 	}
 
@@ -254,15 +253,18 @@ func (rf *Raft) scheduleVoteService() {
 	rf.voteTickerMu.Lock()
 	rf.closeVoteTicker(false)
 	// restart a new timer
-	rf.voteTicker = time.NewTicker(time.Millisecond * getElectionTimeout())
+	timeGap := getElectionTimeout()
+	rf.debug("scheduleVoteService vote timer %dms", timeGap)
+	voteTicker := time.NewTicker(time.Millisecond * timeGap)
 	rf.voteTickerCh = make(chan bool)
 	rf.voteTickerMu.Unlock()
-	rf.debug("create vote ticker %p", rf.voteTickerCh)
+	rf.debug("create vote ticker %p", voteTicker)
 	go func() {
 		localVoteCh := rf.voteTickerCh
 		select {
-		case <-rf.voteTicker.C:
+		case <-voteTicker.C:
 			rf.debug("vote ticker deliver %p", localVoteCh)
+			rf.votedFor = -1
 			go func() {
 				rf.becomeCandidate()
 				return
@@ -281,15 +283,15 @@ func (rf *Raft) scheduleVoteService() {
 func (rf *Raft) scheduleHeartBeatService() {
 	rf.debug("scheduleHeartBeatService")
 	rf.closeHeartBeatTicker()
-	rf.heartbeatTicker = time.NewTicker(time.Millisecond * HEARTBEAT_PERIOD)
+	heartbeatTicker := time.NewTicker(time.Millisecond * HEARTBEAT_PERIOD)
 	rf.heartbeatTickerCh = make(chan bool)
 	go func() {
+		localHeartCh := rf.heartbeatTickerCh
 		select {
-		case <-rf.heartbeatTicker.C:
+		case <-heartbeatTicker.C:
 			go func() {
 				ok := rf.broadcastHeartBeat()
 				if !ok {
-					rf.closeHeartBeatTicker()
 					rf.votedFor = -1
 					rf.becomeFollower()
 				} else {
@@ -298,6 +300,7 @@ func (rf *Raft) scheduleHeartBeatService() {
 				return
 			}()
 		case <-rf.heartbeatTickerCh:
+			rf.debug("close heartbeat ticker %p as close routine", localHeartCh)
 			return
 		case <-rf.exitCh:
 			// rf.debug("HearBeat routine exit as raft exit")
@@ -329,10 +332,15 @@ func (rf *Raft) becomeCandidate() {
 // broadcastVote ...
 // begin vote
 func (rf *Raft) broadcastVote() bool {
+	rf.debug("broadcast Vote")
 	rf.mu.Lock()
-	// GetState test Leader by votedFor, avoid wrong adjudgement here
-	// if leader disconnect, its votedFor always self
-	rf.votedFor = -1
+	defer rf.mu.Unlock()
+
+	if rf.votedFor >= 0 {
+		rf.debug("already voteFor %d after vote timeout", rf.votedFor)
+		return false
+	}
+
 	lastindex := 0
 	lastterm := 0
 	if len(rf.log) > 0 {
@@ -342,7 +350,6 @@ func (rf *Raft) broadcastVote() bool {
 	rf.currentTerm++
 	args := RequestVoteArgs{CandidateTerm: rf.currentTerm, CandidateID: rf.me,
 		LastLogIndex: lastindex, LastLogTerm: lastterm}
-	rf.mu.Unlock()
 
 	sumGrantedVote := 0
 	// need reset vote ticker? NO
@@ -365,18 +372,21 @@ func (rf *Raft) broadcastVote() bool {
 	}
 
 	// become leader
-	rf.debug("broadcast Vote, granted sum %d, majority num %d", sumGrantedVote, rf.majorityNum)
 	if sumGrantedVote >= rf.majorityNum {
 		// assign here to keep GetState() result right
 		rf.votedFor = rf.me
 		return true
 	}
 
+	rf.votedFor = -1
 	return false
 }
 
 func (rf *Raft) broadcastHeartBeat() bool {
 	rf.debug("broadcastHeartBeat")
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	sumOKHeart := 0
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -415,16 +425,16 @@ func (rf *Raft) broadcastHeartBeat() bool {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.debug("Handle RequestVote from %d", args.CandidateID)
 	rf.mu.Lock()
-
 	grantVote := false
 	if args.CandidateTerm < rf.currentTerm {
 		grantVote = false
 	} else if args.CandidateTerm == rf.currentTerm { // keep grant once for each term
 		if args.CandidateID == rf.votedFor {
 			grantVote = true
-		} else {
-			grantVote = false
+		} else if rf.votedFor == -1 {
+			grantVote = true
 		}
 	} else {
 		if rf.votedFor < 0 {
@@ -444,7 +454,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			}
 		}
 	}
-	rf.debug("Handle RequestVote, grantVote %t", grantVote)
 
 	if grantVote {
 		rf.votedFor = args.CandidateID
@@ -492,8 +501,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	return rf.rpcCall(server, "Raft.RequestVote", args, reply)
 }
 
 // MatchLog ...
@@ -566,9 +574,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.scheduleVoteService()
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+func (rf *Raft) rpcCall(server int, rpcName string, args interface{}, reply interface{}) bool {
+	ch := make(chan bool)
+	go func() {
+		ch <- rf.peers[server].Call(rpcName, args, reply)
+	}()
+
+	ok := false
+	select {
+	case ok = <-ch:
+	case <-time.After(time.Millisecond * RPC_CALL_TIMEOUT):
+		rf.debug("rpc %s timeout", rpcName)
+		ok = false
+	}
 	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	return rf.rpcCall(server, "Raft.AppendEntries", args, reply)
 }
 
 // Start ...
