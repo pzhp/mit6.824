@@ -41,7 +41,7 @@ import "labrpc"
 // finish leader in 5s, the tester limits you to 10 heartbeats per second
 const ELECTION_TIMEOUT_MIN int32 = 800     // ms
 const ELECTION_TIMEOUT_MAX int32 = 1200    // ms
-const HEARTBEAT_PERIOD time.Duration = 150 // ms
+const HEARTBEAT_PERIOD time.Duration = 200 // ms
 
 func getElectionTimeout() time.Duration {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -206,21 +206,33 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 func (rf *Raft) closeHeartBeatTicker() {
+	rf.debug("closeHeartBeatTicker")
 	// rf.heartbeatTickerMu.Lock()
 	if rf.heartbeatTickerCh != nil {
-		close(rf.heartbeatTickerCh)
+		rf.heartbeatTickerCh <- true
+		time.Sleep(10 * time.Millisecond)
+		// close(rf.heartbeatTickerCh)
 		rf.heartbeatTickerCh = nil
 	}
 	// rf.heartbeatTickerMu.Unlock()
 }
 
-func (rf *Raft) closeVoteTicker() {
-	// rf.voteTickerMu.Lock()
+func (rf *Raft) closeVoteTicker(block bool) {
+	rf.debug("closeVoteTicker")
+	if block {
+		rf.voteTickerMu.Lock()
+	}
 	if rf.voteTickerCh != nil {
-		close(rf.voteTickerCh)
+		// block by default
+		rf.voteTickerCh <- true
+		time.Sleep(10 * time.Millisecond)
+		// close(rf.voteTickerCh)
 		rf.voteTickerCh = nil
 	}
-	// rf.voteTickerMu.Unlock()
+
+	if block {
+		rf.voteTickerMu.Unlock()
+	}
 }
 
 func (rf *Raft) debug(format string, a ...interface{}) {
@@ -238,62 +250,66 @@ func (rf *Raft) updateLocalCommitIndex(leaderCommitIndex int) {
 }
 
 func (rf *Raft) scheduleVoteService() {
+	rf.debug("scheduleVoteService")
 	rf.voteTickerMu.Lock()
-	defer rf.voteTickerMu.Unlock()
-
-	rf.closeVoteTicker()
+	rf.closeVoteTicker(false)
 	// restart a new timer
 	rf.voteTicker = time.NewTicker(time.Millisecond * getElectionTimeout())
 	rf.voteTickerCh = make(chan bool)
+	rf.voteTickerMu.Unlock()
 	rf.debug("create vote ticker %p", rf.voteTickerCh)
 	go func() {
-		for {
-			select {
-			case <-rf.voteTicker.C:
+		localVoteCh := rf.voteTickerCh
+		select {
+		case <-rf.voteTicker.C:
+			rf.debug("vote ticker deliver %p", localVoteCh)
+			go func() {
 				rf.becomeCandidate()
-			case <-rf.voteTickerCh:
-				rf.debug("close vote ticker %p", rf.voteTickerCh)
 				return
-			case <-rf.exitCh:
-				// rf.debug("Vote routine exit as raft(%p) exit", rf)
-				rf.debug("close vote ticker %p", rf.voteTickerCh)
-				return
-			}
+			}()
+		case <-rf.voteTickerCh:
+			rf.debug("close vote ticker %p as close routine", localVoteCh)
+			return
+		case <-rf.exitCh:
+			// rf.debug("Vote routine exit as raft(%p) exit", rf)
+			// rf.debug("close vote ticker %p as exit", localVoteCh)
+			return
 		}
 	}()
 }
 
 func (rf *Raft) scheduleHeartBeatService() {
+	rf.debug("scheduleHeartBeatService")
 	rf.closeHeartBeatTicker()
 	rf.heartbeatTicker = time.NewTicker(time.Millisecond * HEARTBEAT_PERIOD)
 	rf.heartbeatTickerCh = make(chan bool)
 	go func() {
-		for {
-			select {
-			case <-rf.heartbeatTicker.C:
+		select {
+		case <-rf.heartbeatTicker.C:
+			go func() {
 				ok := rf.broadcastHeartBeat()
 				if !ok {
 					rf.closeHeartBeatTicker()
+					rf.votedFor = -1
 					rf.becomeFollower()
-					return
+				} else {
+					rf.scheduleHeartBeatService()
 				}
-			case <-rf.heartbeatTickerCh:
 				return
-			case <-rf.exitCh:
-				// rf.debug("HearBeat routine exit as raft exit")
-				return
-			}
+			}()
+		case <-rf.heartbeatTickerCh:
+			return
+		case <-rf.exitCh:
+			// rf.debug("HearBeat routine exit as raft exit")
+			return
 		}
 	}()
 }
 
 func (rf *Raft) becomeLeader() {
 	rf.debug("become leader\n")
-	if rf.broadcastHeartBeat() {
-		rf.scheduleHeartBeatService()
-	} else {
-		rf.becomeFollower()
-	}
+	rf.closeVoteTicker(false)
+	rf.scheduleHeartBeatService()
 }
 
 func (rf *Raft) becomeFollower() {
@@ -303,11 +319,10 @@ func (rf *Raft) becomeFollower() {
 
 func (rf *Raft) becomeCandidate() {
 	rf.debug("become candidate\n")
-	if rf.broadcastVote() {
-		rf.voteTickerMu.Lock()
-		defer rf.voteTickerMu.Unlock()
-		rf.closeVoteTicker()
+	if rf.broadcastVote() && rf.broadcastHeartBeat() {
 		rf.becomeLeader()
+	} else {
+		rf.becomeFollower()
 	}
 }
 
@@ -315,12 +330,9 @@ func (rf *Raft) becomeCandidate() {
 // begin vote
 func (rf *Raft) broadcastVote() bool {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	// GetState test Leader by votedFor, avoid wrong adjudgement here
 	// if leader disconnect, its votedFor always self
 	rf.votedFor = -1
-
 	lastindex := 0
 	lastterm := 0
 	if len(rf.log) > 0 {
@@ -330,6 +342,7 @@ func (rf *Raft) broadcastVote() bool {
 	rf.currentTerm++
 	args := RequestVoteArgs{CandidateTerm: rf.currentTerm, CandidateID: rf.me,
 		LastLogIndex: lastindex, LastLogTerm: lastterm}
+	rf.mu.Unlock()
 
 	sumGrantedVote := 0
 	// need reset vote ticker? NO
@@ -341,7 +354,8 @@ func (rf *Raft) broadcastVote() bool {
 
 		var reply RequestVoteReply
 		if rf.sendRequestVote(i, &args, &reply) {
-			rf.debug("send vote to %d, granted %t\n", i, reply.VoteGranted)
+			rf.debug("send vote to %d, granted %t, local term %d, remote Term %d\n",
+				i, reply.VoteGranted, rf.currentTerm, reply.CurrentTerm)
 			if reply.VoteGranted {
 				sumGrantedVote++
 			}
@@ -351,6 +365,7 @@ func (rf *Raft) broadcastVote() bool {
 	}
 
 	// become leader
+	rf.debug("broadcast Vote, granted sum %d, majority num %d", sumGrantedVote, rf.majorityNum)
 	if sumGrantedVote >= rf.majorityNum {
 		// assign here to keep GetState() result right
 		rf.votedFor = rf.me
@@ -361,9 +376,11 @@ func (rf *Raft) broadcastVote() bool {
 }
 
 func (rf *Raft) broadcastHeartBeat() bool {
+	rf.debug("broadcastHeartBeat")
 	sumOKHeart := 0
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
+			sumOKHeart++
 			continue
 		}
 
@@ -397,10 +414,8 @@ func (rf *Raft) broadcastHeartBeat() bool {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.debug("Handle RequestVote")
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	grantVote := false
 	if args.CandidateTerm < rf.currentTerm {
@@ -429,19 +444,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			}
 		}
 	}
+	rf.debug("Handle RequestVote, grantVote %t", grantVote)
 
 	if grantVote {
 		rf.votedFor = args.CandidateID
 		rf.currentTerm = args.CandidateTerm
 		reply.VoteGranted = true
 		reply.CurrentTerm = rf.currentTerm
-		rf.voteTickerMu.Lock()
-		defer rf.voteTickerMu.Unlock()
-		rf.closeVoteTicker()
-		rf.becomeFollower()
 	} else {
 		reply.VoteGranted = false
 		reply.CurrentTerm = rf.currentTerm
+	}
+	rf.mu.Unlock()
+
+	if grantVote {
+		rf.becomeFollower()
 	}
 }
 
@@ -503,10 +520,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// heartbeat
 	if len(args.LogEntries) == 0 {
-		rf.scheduleVoteService()
 		reply.CurrentTerm = rf.currentTerm
 		reply.Success = true
+		rf.votedFor = args.LeaderID
+		rf.currentTerm = args.LeaderTerm
 		rf.updateLocalCommitIndex(args.LeaderCommitIndex)
+		rf.scheduleVoteService()
 		return
 	}
 
@@ -540,6 +559,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		irf++
 	}
 
+	rf.votedFor = args.LeaderID
+	rf.currentTerm = args.LeaderTerm
 	// update commit index
 	rf.updateLocalCommitIndex(args.LeaderCommitIndex)
 	rf.scheduleVoteService()
